@@ -131,4 +131,8 @@ app.patch('/api/reports/:id', admin, h(async (req, res) => {
   res.json(r);
 }));
 
-app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+}
+
+export default app;
