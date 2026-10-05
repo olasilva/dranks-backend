@@ -14,6 +14,18 @@ create table login_logs (
   full_name text, email text, role text,
   logged_in_at timestamptz not null default now()
 );
+create table activity_logs (
+  id uuid primary key default gen_random_uuid(),
+  actor_id uuid references profiles(id) on delete set null,
+  staff_name text not null,
+  actor_role text not null check (actor_role in ('admin','staff')),
+  action text not null, description text not null,
+  amount numeric(12,2), entity_type text, entity_id uuid,
+  created_at timestamptz not null default now()
+);
+create index activity_logs_created_at_idx on activity_logs (created_at desc);
+create unique index activity_logs_sale_once_idx on activity_logs (entity_type, entity_id, action)
+  where entity_type = 'sale' and action = 'Sale / payment';
 create table products (
   id uuid primary key default gen_random_uuid(),
   name text not null, category text,
@@ -32,6 +44,7 @@ create table reports (
 create table sales (
   id uuid primary key default gen_random_uuid(),
   product_id uuid references products(id), product_name text not null,
+  customer_name text,
   staff_id uuid references profiles(id), staff_name text,
   quantity int not null check (quantity > 0),
   unit_price numeric(12,2) not null, total numeric(12,2) not null,
@@ -42,12 +55,13 @@ create table sales (
 -- Only the Node backend (service role key) touches the data.
 alter table profiles enable row level security;
 alter table login_logs enable row level security;
+alter table activity_logs enable row level security;
 alter table products enable row level security;
 alter table reports enable row level security;
 alter table sales enable row level security;
 
 -- Atomic "mark as sold": reduces stock and records the sale in one step.
-create or replace function sell_product(p_product uuid, p_staff uuid, p_qty int, p_date date)
+create or replace function sell_product(p_product uuid, p_staff uuid, p_qty int, p_date date, p_customer_name text default null)
 returns sales language plpgsql as $$
 declare prod products; s sales; sname text;
 begin
@@ -55,8 +69,13 @@ begin
     where id = p_product and active and stock >= p_qty returning * into prod;
   if not found then raise exception 'Not enough stock left for this item'; end if;
   select full_name into sname from profiles where id = p_staff;
-  insert into sales (product_id, product_name, staff_id, staff_name, quantity, unit_price, total, sale_date)
-    values (prod.id, prod.name, p_staff, sname, p_qty, prod.price, prod.price * p_qty, p_date)
+  insert into sales (product_id, product_name, customer_name, staff_id, staff_name, quantity, unit_price, total, sale_date)
+    values (prod.id, prod.name, nullif(btrim(p_customer_name), ''), p_staff, sname, p_qty, prod.price, prod.price * p_qty, p_date)
     returning * into s;
+  insert into activity_logs (actor_id, staff_name, actor_role, action, description, amount, entity_type, entity_id)
+    values (p_staff, sname, 'staff', 'Sale / payment',
+      format('Sold %s x %s%s', s.product_name, s.quantity,
+        case when s.customer_name is null then '' else format(' to %s', s.customer_name) end),
+      s.total, 'sale', s.id);
   return s;
 end $$;

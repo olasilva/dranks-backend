@@ -1,10 +1,14 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import nodemailer from 'nodemailer';
 import { createClient } from '@supabase/supabase-js';
 
 const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, PORT = 5000,
   CLIENT_URL = 'http://localhost:5173', TIMEZONE = 'Africa/Lagos' } = process.env;
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const STAFF_LOGIN_URL = process.env.STAFF_LOGIN_URL || `${CLIENT_URL.split(',')[0].replace(/\/$/, '')}/login`;
 const opts = { auth: { persistSession: false, autoRefreshToken: false } };
 const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, opts);
 const today = () => new Date().toLocaleDateString('en-CA', { timeZone: TIMEZONE }); // YYYY-MM-DD
@@ -18,6 +22,31 @@ app.get('/', (req, res) => res.json({ message: 'Boutique API is running', api: '
 const fail = (status, msg) => { throw Object.assign(new Error(msg), { status }); };
 const h = (fn) => (req, res) => fn(req, res).catch((e) => res.status(e.status || 400).json({ error: e.message }));
 const ok = ({ data, error }) => { if (error) fail(400, error.message); return data; };
+const recordActivity = async (actor, { action, description, amount = null, entityType = null, entityId = null }) =>
+  ok(await db.from('activity_logs').insert({
+    actor_id: actor.id, staff_name: actor.full_name, actor_role: actor.role,
+    action, description, amount, entity_type: entityType, entity_id: entityId,
+  }));
+async function sendStaffWelcomeEmail({ full_name, email, password }) {
+  if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
+    return { sent: false, message: 'Configure GMAIL_USER and GMAIL_APP_PASSWORD to enable email.' };
+  }
+  try {
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+    });
+    await transporter.sendMail({
+      from: { name: 'Dranks', address: GMAIL_USER },
+      to: email,
+      subject: 'Welcome to Dranks: your staff account is ready',
+      text: `Hello ${full_name},\n\nYour staff account with Dranks has been created. Welcome to Dranks!\n\nLogin email: ${email}\nLogin password: ${password}\nSign in here: ${STAFF_LOGIN_URL}\n\nKeep your login details private.`,
+    });
+    return { sent: true };
+  } catch {
+    return { sent: false, message: 'Email delivery failed. Check the Gmail address and App Password.' };
+  }
+}
 
 // Verifies the Supabase token, loads the profile, checks role.
 const guard = (...roles) => async (req, res, next) => {
@@ -41,6 +70,7 @@ app.post('/api/auth/login', h(async (req, res) => {
   if (!p) fail(403, 'No profile for this account');
   if (!p.active) fail(403, 'This account has been disabled');
   await db.from('login_logs').insert({ user_id: p.id, full_name: p.full_name, email: p.email, role: p.role });
+  await recordActivity(p, { action: 'Signed in', description: `${p.full_name} signed in`, entityType: 'login', entityId: p.id });
   res.json({ token: data.session.access_token, user: p });
 }));
 
@@ -57,16 +87,23 @@ app.post('/api/staff', admin, h(async (req, res) => {
   if (error) fail(400, error.message);
   const { error: e2 } = await db.from('profiles').insert({ id: data.user.id, full_name, email, role: 'staff' });
   if (e2) { await db.auth.admin.deleteUser(data.user.id); fail(400, e2.message); }
-  res.status(201).json({ id: data.user.id });
+  const emailResult = await sendStaffWelcomeEmail({ full_name, email, password });
+  await recordActivity(req.user, { action: 'Staff account created', description: `Created staff account for ${full_name}`, entityType: 'staff', entityId: data.user.id });
+  res.status(201).json({ id: data.user.id, email_sent: emailResult.sent, email_message: emailResult.message || null });
 }));
 app.patch('/api/staff/:id', admin, h(async (req, res) => {
   const { active, password } = req.body;
-  if (password) { if (password.length < 6) fail(400, 'Password must be 6+ characters'); ok(await db.auth.admin.updateUserById(req.params.id, { password })); }
-  if (typeof active === 'boolean') ok(await db.from('profiles').update({ active }).eq('id', req.params.id).eq('role', 'staff'));
+  const staff = ok(await db.from('profiles').select('full_name').eq('id', req.params.id).eq('role', 'staff').single());
+  const changes = [];
+  if (password) { if (password.length < 6) fail(400, 'Password must be 6+ characters'); ok(await db.auth.admin.updateUserById(req.params.id, { password })); changes.push('password reset'); }
+  if (typeof active === 'boolean') { ok(await db.from('profiles').update({ active }).eq('id', req.params.id).eq('role', 'staff')); changes.push(active ? 'enabled' : 'disabled'); }
+  if (changes.length) await recordActivity(req.user, { action: 'Staff account updated', description: `${staff.full_name}: ${changes.join(', ')}`, entityType: 'staff', entityId: req.params.id });
   res.json({ done: true });
 }));
 app.get('/api/logins', admin, h(async (req, res) =>
   res.json(ok(await db.from('login_logs').select('*').order('logged_in_at', { ascending: false }).limit(200)))));
+app.get('/api/activity', admin, h(async (req, res) =>
+  res.json(ok(await db.from('activity_logs').select('*').order('created_at', { ascending: false }).limit(500)))));
 app.get('/api/stats', admin, h(async (req, res) => {
   const sales = ok(await db.from('sales').select('*').eq('sale_date', today()).order('sold_at', { ascending: false }));
   const { count: pending } = await db.from('reports').select('id', { count: 'exact', head: true }).eq('status', 'pending');
@@ -82,19 +119,36 @@ const prodFields = ({ name, category, price, stock, image_url }) =>
 app.post('/api/products', admin, h(async (req, res) => {
   const f = prodFields(req.body);
   if (!f.name || f.price === undefined) fail(400, 'Name and price are required');
-  res.status(201).json(ok(await db.from('products').insert(f).select().single()));
+  const product = ok(await db.from('products').insert(f).select().single());
+  await recordActivity(req.user, { action: 'Product added', description: `Added ${product.name} at ${product.price}; stock ${product.stock}`, entityType: 'product', entityId: product.id });
+  res.status(201).json(product);
 }));
-app.put('/api/products/:id', admin, h(async (req, res) =>
-  res.json(ok(await db.from('products').update(prodFields(req.body)).eq('id', req.params.id).select().single()))));
+app.put('/api/products/:id', admin, h(async (req, res) => {
+  const before = ok(await db.from('products').select('*').eq('id', req.params.id).single());
+  const product = ok(await db.from('products').update(prodFields(req.body)).eq('id', req.params.id).select().single());
+  const changes = [];
+  if (Number(before.price) !== Number(product.price)) changes.push(`price ${before.price} -> ${product.price}`);
+  if (before.stock !== product.stock) changes.push(`stock ${before.stock} -> ${product.stock}`);
+  if (before.name !== product.name) changes.push(`name ${before.name} -> ${product.name}`);
+  if (before.category !== product.category) changes.push(`category ${before.category || 'none'} -> ${product.category || 'none'}`);
+  if (before.image_url !== product.image_url) changes.push('image updated');
+  if (changes.length) await recordActivity(req.user, { action: 'Product updated', description: `${product.name}: ${changes.join(', ')}`, entityType: 'product', entityId: product.id });
+  res.json(product);
+}));
 app.delete('/api/products/:id', admin, h(async (req, res) => { // soft delete keeps sales history intact
-  ok(await db.from('products').update({ active: false }).eq('id', req.params.id)); res.json({ done: true });
+  const product = ok(await db.from('products').select('*').eq('id', req.params.id).single());
+  ok(await db.from('products').update({ active: false }).eq('id', req.params.id));
+  await recordActivity(req.user, { action: 'Product deleted', description: `Removed ${product.name}; price ${product.price}; remaining stock ${product.stock}`, entityType: 'product', entityId: product.id });
+  res.json({ done: true });
 }));
 
 // ---------- Sales (staff) ----------
 app.post('/api/sales', guard('staff'), h(async (req, res) => {
   const qty = parseInt(req.body.quantity || 1, 10);
   if (!(qty > 0)) fail(400, 'Quantity must be at least 1');
-  res.status(201).json(ok(await db.rpc('sell_product', { p_product: req.body.product_id, p_staff: req.user.id, p_qty: qty, p_date: today() })));
+  const customerName = String(req.body.customer_name || '').trim();
+  if (customerName.length > 120) fail(400, 'Customer name must be 120 characters or fewer');
+  res.status(201).json(ok(await db.rpc('sell_product', { p_product: req.body.product_id, p_staff: req.user.id, p_qty: qty, p_date: today(), p_customer_name: customerName || null })));
 }));
 app.get('/api/sales/today', guard('staff'), h(async (req, res) =>
   res.json(ok(await db.from('sales').select('*').eq('staff_id', req.user.id).eq('sale_date', today()).order('sold_at', { ascending: false })))));
@@ -108,6 +162,7 @@ app.post('/api/reports', guard('staff'), h(async (req, res) => {
     total_items: sales.reduce((a, s) => a + s.quantity, 0), total_amount: sales.reduce((a, s) => a + Number(s.total), 0),
   }).select().single());
   ok(await db.from('sales').update({ report_id: report.id }).in('id', sales.map((s) => s.id)));
+  await recordActivity(req.user, { action: 'Report submitted', description: `Submitted report for ${report.total_items} items`, entityType: 'report', entityId: report.id });
   res.status(201).json(report);
 }));
 app.get('/api/reports', anyone, h(async (req, res) => {
@@ -128,6 +183,7 @@ app.patch('/api/reports/:id', admin, h(async (req, res) => {
     .eq('id', req.params.id).eq('status', 'pending').select().single());
   // Rejected: free the sales so the staff member can fix things and send a new report.
   if (status === 'rejected') await db.from('sales').update({ report_id: null }).eq('report_id', r.id);
+  await recordActivity(req.user, { action: `Report ${status}`, description: `${status === 'approved' ? 'Approved' : 'Rejected'} ${r.staff_name}'s report`, entityType: 'report', entityId: r.id });
   res.json(r);
 }));
 
